@@ -1,0 +1,11 @@
+ultralytics==8.1.0
+opencv-python-headless==4.9.0.80
+numpy>=1.24.0
+flask==3.0.2
+flask-cors==4.0.0
+flask-socketio==5.3.6
+mediapipe==0.10.11
+scipy>=1.11.0
+filterpy==1.4.5
+lap==0.4.0
+Pillow>=10.0.0
