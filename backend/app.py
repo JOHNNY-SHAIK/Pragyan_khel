@@ -1,252 +1,119 @@
-import os
-import cv2
-import json
-import base64
-import numpy as np
-from flask import Flask, request, jsonify, send_file, Response
+﻿"""
+FocusAI CPU-TURBO Backend v8.0
+Maximum CPU Performance
+"""
+
+from flask import Flask, Response, request, jsonify
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
-from detector import CricketDetector
-from tracker import ObjectTracker
-from blur_engine import BlurEngine
-from processor import VideoProcessor
+import cv2
+import os
+import logging
+from detector_stream import get_detector
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://localhost:5173"])
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+CORS(app)
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
-OUTPUT_FOLDER = os.path.join(os.path.dirname(__file__), 'output')
+UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Initialize components
-detector = CricketDetector()
-tracker = ObjectTracker()
-blur_engine = BlurEngine()
-processor = VideoProcessor(detector, tracker, blur_engine)
+detector = get_detector()
 
-# Store state
-app_state = {
-    'focus_target': None,
-    'blur_intensity': 15,
-    'tracking_mode': 'auto',
-    'show_detections': True
-}
 
-@app.route('/api/health', methods=['GET'])
+def generate_frames():
+    """Ultra-fast streaming"""
+    while True:
+        try:
+            frame = detector.get_next_frame()
+            if frame is None:
+                continue
+            
+            # SPEED: Low quality JPEG
+            ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            if not ret:
+                continue
+            
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+        except GeneratorExit:
+            break
+        except:
+            continue
+
+
+@app.route('/api/health')
 def health():
-    return jsonify({
-        'status': 'running',
-        'model_loaded': detector.model is not None,
-        'version': '2.0 - Cricket Edition'
-    })
+    return jsonify({'status': 'ok', 'version': '8.0-cpu-turbo'})
+
 
 @app.route('/api/upload', methods=['POST'])
-def upload_video():
+def upload():
     if 'video' not in request.files:
-        return jsonify({'error': 'No video file provided'}), 400
+        return jsonify({'error': 'No file'}), 400
     
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+    f = request.files['video']
+    path = os.path.join(UPLOAD_FOLDER, f.filename)
+    f.save(path)
     
-    filepath = os.path.join(UPLOAD_FOLDER, 'input_video.mp4')
-    file.save(filepath)
-    
-    # Get video info
-    cap = cv2.VideoCapture(filepath)
-    info = {
-        'filename': file.filename,
-        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        'fps': int(cap.get(cv2.CAP_PROP_FPS)),
-        'total_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-        'duration': int(cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS))
-    }
-    cap.release()
-    
-    return jsonify({'success': True, 'video_info': info})
+    fps, frames = detector.load_video(path)
+    return jsonify({'success': True, 'fps': fps, 'frames': frames})
 
-@app.route('/api/detect_frame', methods=['POST'])
-def detect_frame():
-    """Detect objects in a single frame"""
-    data = request.json
-    
-    if 'frame' in data:
-        # Decode base64 frame
-        frame_data = base64.b64decode(data['frame'].split(',')[1])
-        nparr = np.frombuffer(frame_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    elif 'video_path' in data and 'frame_number' in data:
-        filepath = os.path.join(UPLOAD_FOLDER, 'input_video.mp4')
-        cap = cv2.VideoCapture(filepath)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, data['frame_number'])
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return jsonify({'error': 'Could not read frame'}), 400
-    else:
-        return jsonify({'error': 'No frame data provided'}), 400
-    
-    # Run detection
-    detections = detector.detect(frame)
-    
-    # Update tracker
-    tracked = tracker.update(detections, frame)
-    
-    return jsonify({
-        'detections': detections,
-        'tracked_objects': tracked,
-        'frame_shape': list(frame.shape)
-    })
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/api/play', methods=['POST'])
+def play():
+    detector.start_processing()
+    return jsonify({'success': True})
+
+
+@app.route('/api/pause', methods=['POST'])
+def pause():
+    detector.stop_processing()
+    return jsonify({'success': True})
+
 
 @app.route('/api/set_focus', methods=['POST'])
 def set_focus():
-    """Set the focus target"""
-    data = request.json
-    app_state['focus_target'] = data.get('target')
-    app_state['blur_intensity'] = data.get('blur_intensity', 15)
+    data = request.get_json()
+    x, y = int(data.get('x', 0)), int(data.get('y', 0))
     
-    return jsonify({'success': True, 'focus_target': app_state['focus_target']})
+    result = detector.set_focus_by_click(x, y)
+    if result:
+        return jsonify({'success': True, 'track_id': result['track_id']})
+    return jsonify({'success': False}), 404
 
-@app.route('/api/process_video', methods=['POST'])
-def process_video():
-    """Process entire video with focus effect"""
-    data = request.json
-    
-    input_path = os.path.join(UPLOAD_FOLDER, 'input_video.mp4')
-    output_path = os.path.join(OUTPUT_FOLDER, 'processed_video.mp4')
-    
-    if not os.path.exists(input_path):
-        return jsonify({'error': 'No video uploaded'}), 400
-    
-    focus_target = data.get('focus_target', app_state['focus_target'])
-    blur_intensity = data.get('blur_intensity', app_state['blur_intensity'])
-    
-    # Process video
-    result = processor.process_video(
-        input_path, 
-        output_path, 
-        focus_target=focus_target,
-        blur_intensity=blur_intensity
-    )
-    
-    return jsonify(result)
 
-@app.route('/api/stream_processed')
-def stream_processed():
-    """Stream processed video frames"""
-    input_path = os.path.join(UPLOAD_FOLDER, 'input_video.mp4')
-    
-    if not os.path.exists(input_path):
-        return jsonify({'error': 'No video uploaded'}), 400
-    
-    def generate_frames():
-        cap = cv2.VideoCapture(input_path)
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Detect
-            detections = detector.detect(frame)
-            
-            # Track
-            tracked = tracker.update(detections, frame)
-            
-            # Apply blur if focus target set
-            if app_state['focus_target']:
-                frame = blur_engine.apply_focus_blur(
-                    frame, tracked, 
-                    app_state['focus_target'],
-                    app_state['blur_intensity']
-                )
-            
-            # Draw detections
-            if app_state['show_detections']:
-                frame = detector.draw_detections(frame, detections, tracked)
-            
-            # Encode frame
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        
-        cap.release()
-    
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/api/clear_focus', methods=['POST'])
+def clear_focus():
+    detector.clear_focus()
+    return jsonify({'success': True})
 
-@app.route('/api/get_processed_video')
-def get_processed_video():
-    """Download processed video"""
-    output_path = os.path.join(OUTPUT_FOLDER, 'processed_video.mp4')
-    if os.path.exists(output_path):
-        return send_file(output_path, mimetype='video/mp4')
-    return jsonify({'error': 'No processed video available'}), 404
 
-# ========== WebSocket Events ==========
+@app.route('/api/set_blur', methods=['POST'])
+def set_blur():
+    data = request.get_json()
+    intensity = int(data.get('intensity', 21))
+    result = detector.set_blur_intensity(intensity)
+    return jsonify({'success': True, 'blur': result})
 
-@socketio.on('connect')
-def handle_connect():
-    print('Client connected')
-    emit('status', {'message': 'Connected to FocusAI Backend'})
 
-@socketio.on('frame')
-def handle_frame(data):
-    """Process frame in real-time via WebSocket"""
-    try:
-        frame_data = base64.b64decode(data['frame'].split(',')[1])
-        nparr = np.frombuffer(frame_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Detect
-        detections = detector.detect(frame)
-        
-        # Track
-        tracked = tracker.update(detections, frame)
-        
-        # Apply blur
-        if app_state['focus_target']:
-            frame = blur_engine.apply_focus_blur(
-                frame, tracked,
-                app_state['focus_target'],
-                app_state['blur_intensity']
-            )
-        
-        # Draw detections
-        frame = detector.draw_detections(frame, detections, tracked)
-        
-        # Encode and send back
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        frame_b64 = base64.b64encode(buffer).decode('utf-8')
-        
-        emit('processed_frame', {
-            'frame': f'data:image/jpeg;base64,{frame_b64}',
-            'detections': detections,
-            'tracked': tracked
-        })
-    except Exception as e:
-        emit('error', {'message': str(e)})
+@app.route('/api/status')
+@app.route('/api/settings')
+def status():
+    return jsonify(detector.get_status())
 
-@socketio.on('set_focus')
-def handle_set_focus(data):
-    app_state['focus_target'] = data.get('target')
-    app_state['blur_intensity'] = data.get('blur_intensity', 15)
-    emit('focus_updated', app_state)
-
-@socketio.on('update_settings')
-def handle_settings(data):
-    app_state.update(data)
-    emit('settings_updated', app_state)
 
 if __name__ == '__main__':
-    print("\n?? FocusAI Backend - Cricket Edition")
-    print("=" * 40)
-    print(f"Server: http://localhost:5000")
-    print(f"Model: YOLOv8n")
-    print("=" * 40 + "\n")
-    
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    logger.info('╔═══════════════════════════════════════════════╗')
+    logger.info('║   FOCUSAI CPU-TURBO v8.0 - NO GPU REQUIRED   ║')
+    logger.info('║   Target: 20-30 FPS on CPU                    ║')
+    logger.info('║   http://localhost:5000                       ║')
+    logger.info('╚═══════════════════════════════════════════════╝')
+    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

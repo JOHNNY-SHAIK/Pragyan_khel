@@ -1,198 +1,148 @@
-import cv2
+﻿import cv2
 import numpy as np
 from ultralytics import YOLO
+from scipy.ndimage import gaussian_filter
+from filterpy.kalman import KalmanFilter
+import logging
 
-class CricketDetector:
-    def __init__(self):
-        self.model = None
-        self.confidence_threshold = 0.4
-        self.load_model()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class AdvancedObjectDetector:
+    def __init__(self, model_size='s'):
+        logger.info(f"Initializing YOLOv8-{model_size}...")
+        self.yolo = YOLO(f'yolov8{model_size}.pt')
+        self.cricket_classes = {0: 'player', 32: 'ball', 35: 'bat', 56: 'chair', 39: 'bottle'}
+        self.trackers = {}
+        self.current_focus = None
+        self.focus_mask = None
+        self.blur_intensity = 35
+        self.sam_available = False
+        logger.info("Detector initialized")
         
-        # Cricket-relevant COCO classes
-        self.cricket_classes = {
-            0: 'player',        # person -> player
-            32: 'ball',         # sports ball -> cricket ball
-            34: 'bat',          # baseball bat -> cricket bat
-            37: 'racket',       # sports equipment
-            29: 'frisbee',      # disc-like objects
-            56: 'chair',        # umpire chair
-            67: 'phone',        # for general detection
-            73: 'laptop',       # scoreboard
-        }
+    def create_kalman_filter(self):
+        kf = KalmanFilter(dim_x=4, dim_z=2)
+        kf.x = np.array([0., 0., 0., 0.])
+        kf.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]])
+        kf.H = np.array([[1,0,0,0],[0,1,0,0]])
+        kf.P *= 1000
+        kf.R = np.array([[5,0],[0,5]])
+        kf.Q = np.eye(4) * 0.1
+        return kf
         
-        # Colors for each class
-        self.class_colors = {
-            'player': (0, 255, 0),      # Green
-            'ball': (0, 0, 255),        # Red
-            'bat': (255, 165, 0),       # Orange
-            'racket': (255, 255, 0),    # Yellow
-            'frisbee': (128, 0, 128),   # Purple
-            'chair': (0, 128, 128),     # Teal
-            'phone': (255, 192, 203),   # Pink
-            'laptop': (128, 128, 0),    # Olive
-            'unknown': (200, 200, 200)  # Gray
-        }
-    
-    def load_model(self):
-        """Load YOLOv8 nano model"""
-        try:
-            self.model = YOLO('yolov8n.pt')  # Auto-downloads if not present
-            print("? YOLOv8n model loaded successfully")
-        except Exception as e:
-            print(f"? Error loading model: {e}")
-            # Fallback: try to download
-            try:
-                self.model = YOLO('yolov8n.pt')
-                print("? YOLOv8n downloaded and loaded")
-            except Exception as e2:
-                print(f"? Fatal error: {e2}")
-    
-    def detect(self, frame, conf=None):
-        """Run detection on a frame"""
-        if self.model is None:
-            return []
-        
-        threshold = conf or self.confidence_threshold
-        
-        try:
-            results = self.model(frame, conf=threshold, verbose=False)[0]
-            
-            detections = []
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
+    def detect_objects(self, frame, conf_threshold=0.25):
+        results = self.yolo.predict(frame, conf=conf_threshold, iou=0.4, imgsz=1280, classes=list(self.cricket_classes.keys()), verbose=False)
+        detections = []
+        for result in results:
+            boxes = result.boxes
+            masks = result.masks
+            for i, box in enumerate(boxes):
+                class_id = int(box.cls[0])
                 confidence = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                
-                # Map to cricket-relevant class names
-                class_name = self.cricket_classes.get(cls_id, None)
-                
-                # Skip non-cricket classes
-                if class_name is None:
-                    class_name = results.names[cls_id]
-                
-                detection = {
-                    'id': len(detections),
-                    'class': class_name,
-                    'class_id': cls_id,
-                    'confidence': round(confidence, 3),
-                    'bbox': [x1, y1, x2 - x1, y2 - y1],  # x, y, w, h
-                    'bbox_xyxy': [x1, y1, x2, y2],
-                    'center': [(x1 + x2) // 2, (y1 + y2) // 2]
-                }
+                mask = None
+                if masks is not None and i < len(masks):
+                    mask = masks[i].data.cpu().numpy()[0]
+                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
+                detection = {'class_id': class_id, 'class_name': self.cricket_classes.get(class_id, 'unknown'), 'confidence': confidence, 'bbox': (x1,y1,x2,y2), 'center': ((x1+x2)//2, (y1+y2)//2), 'mask': mask, 'id': f"{class_id}_{i}"}
                 detections.append(detection)
-            
-            return detections
-            
-        except Exception as e:
-            print(f"Detection error: {e}")
-            return []
+                if class_id == 32:
+                    if detection['id'] not in self.trackers:
+                        self.trackers[detection['id']] = self.create_kalman_filter()
+                    kf = self.trackers[detection['id']]
+                    kf.predict()
+                    kf.update(np.array(detection['center']))
+        return detections
     
-    def detect_cricket_specific(self, frame):
-        """Enhanced detection with cricket-specific post-processing"""
-        detections = self.detect(frame)
-        
-        # Post-processing for cricket context
-        enhanced = []
-        
-        for det in detections:
-            # Enhance ball detection - small round objects
-            if det['class'] == 'ball':
-                w, h = det['bbox'][2], det['bbox'][3]
-                aspect_ratio = w / max(h, 1)
-                
-                # Cricket ball should be roughly circular and small
-                if 0.7 < aspect_ratio < 1.4 and w < frame.shape[1] * 0.1:
-                    det['cricket_type'] = 'cricket_ball'
-                    det['confidence'] = min(det['confidence'] * 1.2, 1.0)
-                    enhanced.append(det)
+    def create_elliptical_mask(self, shape, bbox, feather_amount=30):
+        mask = np.zeros(shape, dtype=np.float32)
+        x1, y1, x2, y2 = bbox
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        width = max(x2 - x1, 1)
+        height = max(y2 - y1, 1)
+        cv2.ellipse(mask, (center_x, center_y), (width//2+feather_amount, height//2+feather_amount), 0, 0, 360, 1, -1)
+        mask = gaussian_filter(mask, sigma=feather_amount//2)
+        if mask.max() > 0:
+            mask = mask / mask.max()
+        return mask
+    
+    def apply_selective_blur(self, frame, mask, blur_intensity=None):
+        if blur_intensity is None:
+            blur_intensity = self.blur_intensity
+        if blur_intensity % 2 == 0:
+            blur_intensity += 1
+        if len(mask.shape) == 3:
+            mask = mask[:,:,0]
+        mask = mask.astype(np.float32)
+        if mask.max() > 0:
+            mask = mask / mask.max()
+        if mask.shape[:2] != frame.shape[:2]:
+            mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
+        distance_map = cv2.distanceTransform((1-mask).astype(np.uint8), cv2.DIST_L2, 5)
+        if distance_map.max() > 0:
+            distance_map = distance_map / distance_map.max()
+        blur_weak = cv2.GaussianBlur(frame, (21,21), 0)
+        blur_medium = cv2.GaussianBlur(frame, (51,51), 0)
+        blur_strong = cv2.GaussianBlur(frame, (blur_intensity, blur_intensity), 0)
+        blurred = np.zeros_like(frame, dtype=np.float32)
+        dist_weak = distance_map < 0.3
+        dist_medium = (distance_map >= 0.3) & (distance_map < 0.6)
+        dist_strong = distance_map >= 0.6
+        blurred[dist_weak] = blur_weak[dist_weak]
+        blurred[dist_medium] = blur_medium[dist_medium]
+        blurred[dist_strong] = blur_strong[dist_strong]
+        mask_3d = np.expand_dims(mask, axis=2)
+        output = mask_3d * frame.astype(np.float32) + (1-mask_3d) * blurred
+        return np.clip(output, 0, 255).astype(np.uint8)
+    
+    def set_focus(self, frame, click_pos, detections):
+        x_click, y_click = click_pos
+        for detection in detections:
+            bbox = detection['bbox']
+            x1, y1, x2, y2 = bbox
+            if x1 <= x_click <= x2 and y1 <= y_click <= y2:
+                if detection['mask'] is not None:
+                    mask_value = detection['mask'][y_click, x_click]
+                    if mask_value > 0.5:
+                        self.current_focus = detection['id']
+                        self.focus_mask = self.create_elliptical_mask(frame.shape[:2], bbox)
+                        logger.info(f"Focus: {detection['class_name']}")
+                        return detection
                 else:
-                    enhanced.append(det)
-            
-            # Enhance player detection
-            elif det['class'] == 'player':
-                h = det['bbox'][3]
-                # Players should be reasonably sized
-                if h > frame.shape[0] * 0.15:
-                    det['cricket_type'] = 'batsman' if self._is_batting_pose(det, detections) else 'fielder'
-                    enhanced.append(det)
-                else:
-                    enhanced.append(det)
-            
-            # Enhance bat detection
-            elif det['class'] == 'bat':
-                det['cricket_type'] = 'cricket_bat'
-                enhanced.append(det)
-            
-            else:
-                enhanced.append(det)
-        
-        return enhanced if enhanced else detections
+                    self.current_focus = detection['id']
+                    self.focus_mask = self.create_elliptical_mask(frame.shape[:2], bbox)
+                    logger.info(f"Focus: {detection['class_name']}")
+                    return detection
+        return None
     
-    def _is_batting_pose(self, player_det, all_detections):
-        """Simple heuristic to detect if player is batting"""
-        player_center = player_det['center']
-        
-        for det in all_detections:
-            if det['class'] == 'bat':
-                bat_center = det['center']
-                distance = np.sqrt(
-                    (player_center[0] - bat_center[0])**2 + 
-                    (player_center[1] - bat_center[1])**2
-                )
-                if distance < player_det['bbox'][3]:  # Within player height
-                    return True
-        return False
+    def update_focus_mask(self, frame, detections):
+        if self.current_focus is None:
+            return None
+        for detection in detections:
+            if detection['id'] == self.current_focus:
+                self.focus_mask = self.create_elliptical_mask(frame.shape[:2], detection['bbox'])
+                return self.focus_mask
+        if self.current_focus in self.trackers:
+            kf = self.trackers[self.current_focus]
+            predicted_pos = kf.x[:2]
+            estimated_bbox = (int(predicted_pos[0]-20), int(predicted_pos[1]-20), int(predicted_pos[0]+20), int(predicted_pos[1]+20))
+            self.focus_mask = self.create_elliptical_mask(frame.shape[:2], estimated_bbox)
+            return self.focus_mask
+        return None
     
-    def draw_detections(self, frame, detections, tracked_objects=None):
-        """Draw detection boxes on frame"""
-        output = frame.copy()
-        
-        for det in detections:
-            x, y, w, h = det['bbox']
-            class_name = det.get('cricket_type', det['class'])
-            confidence = det['confidence']
-            
-            color = self.class_colors.get(det['class'], self.class_colors['unknown'])
-            
-            # Check if this object is being tracked
-            is_tracked = False
-            if tracked_objects:
-                for tracked in tracked_objects:
-                    if tracked.get('detection_id') == det['id']:
-                        is_tracked = True
-                        color = (0, 229, 255)  # Cyan for tracked
-                        break
-            
-            # Draw bounding box
-            thickness = 3 if is_tracked else 2
-            cv2.rectangle(output, (x, y), (x + w, y + h), color, thickness)
-            
-            # Draw corner accents for tracked objects
-            if is_tracked:
-                corner_len = 20
-                # Top-left
-                cv2.line(output, (x, y), (x + corner_len, y), (0, 87, 255), 4)
-                cv2.line(output, (x, y), (x, y + corner_len), (0, 87, 255), 4)
-                # Top-right
-                cv2.line(output, (x + w, y), (x + w - corner_len, y), (0, 87, 255), 4)
-                cv2.line(output, (x + w, y), (x + w, y + corner_len), (0, 87, 255), 4)
-                # Bottom-left
-                cv2.line(output, (x, y + h), (x + corner_len, y + h), (0, 87, 255), 4)
-                cv2.line(output, (x, y + h), (x, y + h - corner_len), (0, 87, 255), 4)
-                # Bottom-right
-                cv2.line(output, (x + w, y + h), (x + w - corner_len, y + h), (0, 87, 255), 4)
-                cv2.line(output, (x + w, y + h), (x + w, y + h - corner_len), (0, 87, 255), 4)
-            
-            # Label background
-            label = f"{class_name} {confidence:.0%}"
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(output, (x, y - label_size[1] - 10), 
-                         (x + label_size[0] + 10, y), color, -1)
-            cv2.putText(output, label, (x + 5, y - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        return output
+    def clear_focus(self):
+        self.current_focus = None
+        self.focus_mask = None
+        logger.info("Focus cleared")
     
-    def get_detectable_classes(self):
-        """Return list of detectable cricket classes"""
-        return list(self.cricket_classes.values())
+    def set_blur_intensity(self, intensity):
+        self.blur_intensity = intensity if intensity % 2 == 1 else intensity + 1
+        logger.info(f"Blur: {self.blur_intensity}")
+
+_detector = None
+def get_detector():
+    global _detector
+    if _detector is None:
+        _detector = AdvancedObjectDetector(model_size='s')
+    return _detector
